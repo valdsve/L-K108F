@@ -65,13 +65,12 @@ Reference files are not included in this repository and should be downloaded dir
 ```text
 MITF_RNAseq_reanalysis/
 ├── README.md
+├── sessionInfo.txt
+│
 ├── analysis/
-│   └── DESeq2_BioProj.Rmd
+│   └── DESeq2_BioProj_LÆK108F.Rmd
+│
 ├── metadata/
-│   └── metadata.tsv
-├── scripts/
-│   └── download_fastq.sh
-├── results/
-│   ├── figures/
-│   └── tables/
-└── sessionInfo.txt
+   ├── metadata.tsv
+   └── ena_runs.tsv
+
