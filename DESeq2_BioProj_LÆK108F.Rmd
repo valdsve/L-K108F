@@ -1,0 +1,1689 @@
+---
+title: "GSE264653: siMITF vs siControl RNA-seq analysis"
+author: "Valdimar"
+date: "2026-10-04"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+# Overview
+
+This notebook analyses the untreated (UT) U2OS samples from GSE264653, comparing **siMITF** with **siControl** using kallisto quantification, tximport and DESeq2.
+
+The analysis is organised into four main parts:
+
+1. import and preprocessing,
+2. sample-level quality control,
+3. differential expression,
+4. functional enrichment.
+
+A separate validation section repeats the sample-level analysis using the **authors' deposited kallisto abundance files**. This is useful because two samples show an unusual expression pattern that is also present in the authors' processed data.
+
+# 1. Setup
+
+## 1.1 Project directory
+
+```{r setup, include=FALSE}
+project_dir <- "C:/Users/valds/OneDrive - Menntaský/Phd/Aðferðir í greiningu kjarnsýra og lífupplýsingafræðileg greining/PROJECT/GSE264653"
+
+knitr::opts_knit$set(root.dir = project_dir)
+
+knitr::opts_chunk$set(
+  echo = TRUE,
+  message = FALSE,
+  warning = FALSE,
+  fig.width = 8,
+  fig.height = 6
+)
+```
+
+## 1.2 Package installation
+
+```{r install-packages, eval=FALSE}
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+install.packages(c(
+  "ggplot2",
+  "ggrepel",
+  "pheatmap",
+  "matrixStats"
+))
+
+BiocManager::install(c(
+  "tximport",
+  "DESeq2",
+  "rtracklayer",
+  "apeglm",
+  "clusterProfiler",
+  "org.Hs.eg.db",
+  "ReactomePA",
+  "enrichplot"
+))
+```
+
+## 1.3 Load packages
+
+```{r load-packages}
+library(tximport)
+library(DESeq2)
+library(rtracklayer)
+
+library(ggplot2)
+library(ggrepel)
+library(pheatmap)
+library(matrixStats)
+
+library(apeglm)
+
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ReactomePA)
+library(enrichplot)
+```
+
+## 1.4 Output folders
+
+```{r output-folders}
+dir.create("results/deseq2", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/deseq2/figures", recursive = TRUE, showWarnings = FALSE)
+dir.create("results/deseq2/tables", recursive = TRUE, showWarnings = FALSE)
+```
+
+# 2. Metadata and kallisto files
+
+## 2.1 Load metadata
+
+The metadata table contains one row per sample and columns including `run`, `condition`, `ncs` and `replicate`.
+
+```{r metadata}
+metadata <- read.delim("metadata.tsv")
+
+metadata$condition <- factor(
+  metadata$condition,
+  levels = c("siControl", "siMITF")
+)
+
+metadata$replicate <- factor(metadata$replicate)
+
+rownames(metadata) <- metadata$run
+
+metadata
+```
+
+Confirm that the design contains three siControl and three siMITF samples.
+
+```{r metadata-check}
+table(metadata$condition)
+metadata[, c("run", "condition", "ncs", "replicate")]
+```
+
+## 2.2 Define kallisto abundance files
+
+```{r kallisto-files}
+files <- file.path(
+  "results",
+  "kallisto",
+  metadata$run,
+  "abundance.tsv"
+)
+
+names(files) <- metadata$run
+
+file.exists(files)
+```
+
+Note, all six values should be `TRUE`.
+
+# 3. Transcript-to-gene mapping
+
+The same Ensembl GRCh38 release 116 GTF used in the original re-analysis is used here.
+
+```{r import-gtf}
+gtf <- import("reference/Homo_sapiens.GRCh38.116.gtf")
+```
+
+Create a transcript-to-gene mapping for tximport.
+
+```{r tx2gene}
+tx2gene <- unique(
+  data.frame(
+    transcript_id = gtf$transcript_id,
+    gene_id = gtf$gene_id
+  )
+)
+
+tx2gene <- tx2gene[
+  !is.na(tx2gene$transcript_id) &
+  !is.na(tx2gene$gene_id),
+]
+
+head(tx2gene)
+dim(tx2gene)
+```
+
+Create a gene annotation table for later use.
+
+```{r gene-annotation}
+gene_annot <- unique(
+  data.frame(
+    gene_id = gtf$gene_id,
+    gene_name = gtf$gene_name,
+    gene_biotype = gtf$gene_biotype
+  )
+)
+
+gene_annot <- gene_annot[
+  !is.na(gene_annot$gene_id),
+]
+
+head(gene_annot)
+```
+
+# 4. Import kallisto quantification with tximport
+
+```{r tximport}
+txi <- tximport(
+  files,
+  type = "kallisto",
+  tx2gene = tx2gene,
+  ignoreTxVersion = TRUE
+)
+```
+
+Quick inspection of the resulting gene-level matrices.
+
+```{r tximport-check}
+dim(txi$counts)
+head(txi$counts)
+```
+
+# 5. Create the DESeq2 dataset
+
+```{r create-dds}
+dds <- DESeqDataSetFromTximport(
+  txi,
+  colData = metadata,
+  design = ~ condition
+)
+```
+
+Remove genes with zero counts across every sample.
+
+```{r minimal-filter}
+keep <- rowSums(counts(dds)) > 0
+dds <- dds[keep, ]
+
+dim(dds)
+```
+
+Run the DESeq2 model.
+
+```{r run-deseq2}
+dds <- DESeq(dds)
+```
+
+The comparison of interest is defined as **siMITF versus siControl**.
+
+```{r deseq-results}
+res <- results(
+  dds,
+  contrast = c("condition", "siMITF", "siControl"),
+  alpha = 0.05
+)
+
+summary(res)
+```
+
+Therefore:
+
+- positive log2 fold change = higher expression in **siMITF**,
+- negative log2 fold change = higher expression in **siControl**.
+
+# 6. Sample-level quality control
+
+## 6.1 Variance-stabilising transformation
+
+```{r vst}
+vsd <- vst(dds, blind = FALSE)
+```
+
+## 6.2 PCA
+
+```{r pca-basic}
+plotPCA(vsd, intgroup = "condition")
+```
+
+Create a labelled PCA.
+
+```{r pca-labelled}
+pcaData <- plotPCA(
+  vsd,
+  intgroup = "condition",
+  returnData = TRUE
+)
+
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+
+ggplot(
+  pcaData,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = condition,
+    label = name
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    size = 3.5,
+    max.overlaps = Inf,
+    box.padding = 0.6,
+    point.padding = 0.4,
+    show.legend = FALSE
+  ) +
+  xlab(paste0("PC1: ", percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", percentVar[2], "% variance")) +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic()
+```
+
+The labelled coordinates can be inspected directly.
+
+```{r pca-coordinates}
+pcaData[, c("name", "condition", "PC1", "PC2")]
+```
+
+## 6.3 Sample correlation heatmap
+
+```{r sample-correlation}
+cor_mat <- cor(assay(vsd))
+
+pheatmap(
+  cor_mat,
+  main = "Sample correlations"
+)
+```
+
+## 6.4 Sample-to-sample distances
+
+```{r sample-distances}
+sampleDists <- dist(t(assay(vsd)))
+sampleDistMatrix <- as.matrix(sampleDists)
+
+pheatmap(
+  sampleDistMatrix,
+  clustering_distance_rows = sampleDists,
+  clustering_distance_cols = sampleDists,
+  main = "Sample-to-sample distances"
+)
+```
+
+## 6.5 Library sizes and normalization
+
+Do this for quick sanity to verify that normalization has happened properly
+
+```{r library-sizes}
+raw_library_sizes <- colSums(counts(dds))
+normalized_library_sizes <- colSums(counts(dds, normalized = TRUE))
+
+raw_library_sizes
+normalized_library_sizes
+```
+
+Because this dataset was created through tximport, DESeq2 uses gene- and sample-specific normalization factors derived from transcript-length information.
+
+```{r normalization-factors}
+sizeFactors(dds)
+dim(normalizationFactors(dds))
+```
+
+A `NULL` value from `sizeFactors(dds)` is expected here because normalization factors are present instead.
+
+## 6.6 Most variable genes
+
+```{r variable-gene-heatmap}
+rv <- rowVars(assay(vsd))
+top50 <- order(rv, decreasing = TRUE)[1:50]
+
+annotation_col <- as.data.frame(colData(dds)[, "condition", drop = FALSE])
+
+pheatmap(
+  assay(vsd)[top50, ],
+  scale = "row",
+  annotation_col = annotation_col,
+  main = "Top 50 most variable genes"
+)
+```
+
+# 7. Investigation of unusual sample structure
+
+The PCA and correlation analyses identify `SRR28780442` and `SRR28780445` as markedly different from the other four samples. These samples belong to opposite treatment conditions, suggesting that the dominant source of variance is not simply the siMITF versus siControl contrast.
+
+## 7.1 Genes that distinguish the two unusual samples
+
+```{r unusual-sample-genes}
+mat <- assay(vsd)
+
+group_2 <- rowMeans(
+  mat[, c("SRR28780442", "SRR28780445")]
+)
+
+group_4 <- rowMeans(
+  mat[, c(
+    "SRR28780448",
+    "SRR28780436",
+    "SRR28780439",
+    "SRR28780433"
+  )]
+)
+
+difference <- group_2 - group_4
+
+top_unusual_genes <- sort(
+  abs(difference),
+  decreasing = TRUE
+)
+
+head(top_unusual_genes, 30)
+```
+
+## 7.2 Immune-associated genes identified among the strongest differences
+
+```{r immune-gene-check}
+genes_check <- names(head(top_unusual_genes, 30))
+
+round(
+  assay(vsd)[genes_check, ],
+  2
+)
+
+gene_annot <- unique(
+  data.frame(
+    gene_id = gtf$gene_id,
+    gene_name = gtf$gene_name,
+    gene_biotype = gtf$gene_biotype
+  )
+)
+
+gene_annot <- gene_annot[
+  !is.na(gene_annot$gene_id),
+]
+
+
+gene_annot[
+  gene_annot$gene_id %in% genes_check,
+]
+
+annotated_genes <- gene_annot[
+  match(genes_check, gene_annot$gene_id),
+]
+
+annotated_genes
+```
+
+## 7.3 GO enrichment of these 30 genes
+```{r}
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+ego_unusual <- enrichGO(
+  gene = genes_check,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(ego_unusual), 20)
+```
+
+## 7.5 Dot plot from GO enrichment
+```{r}
+dotplot(
+  ego_unusual,
+  showCategory = 15,
+  title = "Biological processes enriched in unusual-sample genes"
+)
+```
+
+Note that these genes are examined as a QC finding rather than being used to remove samples from the main analysis.
+
+# 8. Validation using the authors' deposited kallisto files
+
+This section repeats the sample-level analysis using the six corresponding `abundance.tsv.gz` files deposited by the authors. The same release 116 transcript-to-gene mapping is deliberately retained so that the primary difference between analyses is the kallisto input itself.
+
+## 8.1 Define the authors' abundance files
+
+```{r authors-files}
+authors_files <- c(
+  SRR28780448 = "authors_processed/GSM8224568_U2-1_Sc_UT_abundance.tsv.gz",
+  SRR28780442 = "authors_processed/GSM8224574_U2-2_Sc_UT_abundance.tsv.gz",
+  SRR28780436 = "authors_processed/GSM8224580_U2-3_Sc_UT_abundance.tsv.gz",
+  SRR28780445 = "authors_processed/GSM8224571_U2-1_siMi_UT_abundance.tsv.gz",
+  SRR28780439 = "authors_processed/GSM8224577_U2-2_siMi_UT_abundance.tsv.gz",
+  SRR28780433 = "authors_processed/GSM8224583_U2-3_siMi_UT_abundance.tsv.gz"
+)
+
+file.exists(authors_files)
+```
+
+## 8.2 Create metadata for the authors' files
+
+```{r authors-metadata}
+authors_metadata <- data.frame(
+  run = names(authors_files),
+  condition = c(
+    "siControl",
+    "siControl",
+    "siControl",
+    "siMITF",
+    "siMITF",
+    "siMITF"
+  ),
+  replicate = factor(c(1, 2, 3, 1, 2, 3))
+)
+
+authors_metadata$condition <- factor(
+  authors_metadata$condition,
+  levels = c("siControl", "siMITF")
+)
+
+rownames(authors_metadata) <- authors_metadata$run
+
+authors_metadata
+```
+
+## 8.3 Import authors' kallisto output
+
+```{r authors-tximport}
+txi_authors <- tximport(
+  authors_files,
+  type = "kallisto",
+  tx2gene = tx2gene,
+  ignoreTxVersion = TRUE
+)
+
+dds_authors <- DESeqDataSetFromTximport(
+  txi_authors,
+  colData = authors_metadata,
+  design = ~ condition
+)
+
+dds_authors <- dds_authors[
+  rowSums(counts(dds_authors)) > 0,
+]
+
+dds_authors <- DESeq(dds_authors)
+
+vsd_authors <- vst(
+  dds_authors,
+  blind = FALSE
+)
+```
+
+## 8.4 PCA of authors' processed data
+
+```{r authors-pca}
+pca_authors <- plotPCA(
+  vsd_authors,
+  intgroup = "condition",
+  returnData = TRUE
+)
+
+authors_percentVar <- round(
+  100 * attr(pca_authors, "percentVar")
+)
+
+ggplot(
+  pca_authors,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = condition,
+    label = name
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    size = 3.5,
+    max.overlaps = Inf,
+    box.padding = 0.6,
+    point.padding = 0.4,
+    show.legend = FALSE
+  ) +
+  xlab(paste0("PC1: ", authors_percentVar[1], "% variance")) +
+  ylab(paste0("PC2: ", authors_percentVar[2], "% variance")) +
+  scale_x_continuous(expand = expansion(mult = 0.15)) +
+  scale_y_continuous(expand = expansion(mult = 0.15)) +
+  theme_classic()
+
+```
+
+```{r authors-pca-coordinates}
+pca_authors[, c("name", "condition", "PC1", "PC2")]
+```
+
+## 8.5 Check the same immune-associated genes
+
+```{r authors-immune-check}
+round(
+  assay(vsd_authors)[genes_check, ],
+  2
+)
+```
+
+## 8.6 Compare the authors' and our analysis
+```{r}
+# Paired heatmap: our analysis vs authors' deposited kallisto data
+
+library(pheatmap)
+
+# Extract the same genes from both VST matrices
+mat_ours <- assay(vsd)[genes_check, ]
+mat_authors <- assay(vsd_authors)[genes_check, ]
+
+# Put samples in the same order
+sample_order <- c(
+  "SRR28780448",
+  "SRR28780442",
+  "SRR28780436",
+  "SRR28780445",
+  "SRR28780439",
+  "SRR28780433"
+)
+
+mat_ours <- mat_ours[, sample_order]
+mat_authors <- mat_authors[, sample_order]
+
+# Interleave columns so each sample is shown as a pair:
+# Our analysis | Authors' data
+mat_compare <- do.call(
+  cbind,
+  lapply(sample_order, function(s) {
+    cbind(
+      Our_analysis = mat_ours[, s],
+      Authors_data = mat_authors[, s]
+    )
+  })
+)
+
+# Give columns informative names
+colnames(mat_compare) <- as.vector(
+  rbind(
+    paste0(sample_order, "_ours"),
+    paste0(sample_order, "_authors")
+  )
+)
+
+# Replace Ensembl IDs with gene symbols
+gene_labels <- gene_annot$gene_name[
+  match(rownames(mat_compare), gene_annot$gene_id)
+]
+
+gene_labels[
+  is.na(gene_labels) | gene_labels == ""
+] <- rownames(mat_compare)[
+  is.na(gene_labels) | gene_labels == ""
+]
+
+rownames(mat_compare) <- gene_labels
+
+# Add annotation showing data source
+annotation_col <- data.frame(
+  Source = rep(
+    c("Our analysis", "Authors' data"),
+    times = length(sample_order)
+  )
+)
+
+rownames(annotation_col) <- colnames(mat_compare)
+
+# Plot paired heatmap
+pheatmap(
+  mat_compare,
+  scale = "row",
+  cluster_cols = FALSE,
+  cluster_rows = TRUE,
+  annotation_col = annotation_col,
+  border_color = "white",
+  main = "Comparison with authors' processed kallisto data",
+  fontsize_col = 8,
+  fontsize_row = 9
+)
+```
+
+# 9. PCA without possible outliers
+```{r}
+library(ggplot2)
+library(ggrepel)
+
+# Remove the two unusual samples
+dds_no_outliers <- dds[
+  ,
+  !colnames(dds) %in% c(
+    "SRR28780442",
+    "SRR28780445"
+  )
+]
+
+dds_no_outliers$condition <- droplevels(
+  dds_no_outliers$condition
+)
+
+# Variance-stabilizing transformation
+vsd_no_outliers <- vst(
+  dds_no_outliers,
+  blind = FALSE
+)
+
+# Extract PCA coordinates
+pca_no_outliers <- plotPCA(
+  vsd_no_outliers,
+  intgroup = "condition",
+  returnData = TRUE
+)
+
+# Percentage of variance explained
+percentVar <- round(
+  100 * attr(pca_no_outliers, "percentVar")
+)
+
+# Plot
+ggplot(
+  pca_no_outliers,
+  aes(
+    x = PC1,
+    y = PC2,
+    color = condition,
+    label = name
+  )
+) +
+  geom_point(size = 4) +
+  geom_text_repel(
+    size = 3.5,
+    box.padding = 0.6,
+    point.padding = 0.4,
+    max.overlaps = Inf,
+    show.legend = FALSE
+  ) +
+  scale_x_continuous(
+    expand = expansion(mult = 0.15)
+  ) +
+  scale_y_continuous(
+    expand = expansion(mult = 0.20)
+  ) +
+  labs(
+    title = "PCA after exclusion of SRR28780442 and SRR28780445",
+    x = paste0("PC1: ", percentVar[1], "% variance"),
+    y = paste0("PC2: ", percentVar[2], "% variance"),
+    color = "Condition"
+  ) +
+  theme_classic()
+```
+
+
+
+The authors' processed kallisto files reproduce the same unusual immune-associated expression pattern in `SRR28780442` and `SRR28780445`, indicating that this feature is already present in the deposited processed data.
+
+# 10. Differential expression results
+
+## 10.1 Create an annotated DESeq2 results table
+
+```{r results-table}
+res_df <- as.data.frame(res)
+res_df$gene_id <- rownames(res_df)
+
+res_annot <- merge(
+  res_df,
+  gene_annot,
+  by = "gene_id",
+  all.x = TRUE
+)
+
+res_annot <- res_annot[
+  order(res_annot$padj),
+]
+
+head(
+  res_annot[
+    ,
+    c(
+      "gene_id",
+      "gene_name",
+      "gene_biotype",
+      "baseMean",
+      "log2FoldChange",
+      "lfcSE",
+      "stat",
+      "pvalue",
+      "padj"
+    )
+  ],
+  20
+)
+```
+
+## 10.2 Number of significant genes
+
+```{r significant-counts}
+sum(res$padj < 0.05, na.rm = TRUE)
+
+sum(
+  res$padj < 0.05 &
+  res$log2FoldChange > 0,
+  na.rm = TRUE
+)
+
+sum(
+  res$padj < 0.05 &
+  res$log2FoldChange < 0,
+  na.rm = TRUE
+)
+```
+
+## 10.3 MA plot
+
+```{r ma-plot}
+plotMA(
+  res,
+  ylim = c(-5, 5),
+  alpha = 0.05
+)
+```
+
+## 10.4 Top differentially expressed genes
+
+```{r top-de-genes}
+top20 <- head(
+  res_annot[
+    !is.na(res_annot$padj),
+    c(
+      "gene_id",
+      "gene_name",
+      "gene_biotype",
+      "baseMean",
+      "log2FoldChange",
+      "padj"
+    )
+  ],
+  20
+)
+
+top20
+```
+
+# 11. Heatmap of top differential-expression hits
+
+```{r top-de-heatmap}
+# Top 10 DE genes
+top_ids <- top20$gene_id[1:10]
+
+mat_top <- assay(vsd)[top_ids, ]
+
+# Replace Ensembl IDs with gene symbols
+row_labels <- gene_annot$gene_name[
+  match(rownames(mat_top), gene_annot$gene_id)
+]
+
+row_labels[
+  is.na(row_labels) | row_labels == ""
+] <- rownames(mat_top)[
+  is.na(row_labels) | row_labels == ""
+]
+
+rownames(mat_top) <- row_labels
+
+
+# Create annotation that exactly matches these 6 samples
+annotation_top <- data.frame(
+  condition = colData(dds)$condition
+)
+
+rownames(annotation_top) <- colnames(dds)
+
+# Make sure order matches the heatmap matrix
+annotation_top <- annotation_top[
+  colnames(mat_top),
+  ,
+  drop = FALSE
+]
+
+
+# Plot
+pheatmap::pheatmap(
+  mat_top,
+  scale = "row",
+  annotation_col = annotation_top,
+  main = "Top 10 differentially expressed genes",
+  border_color = NA
+)
+```
+
+# 12. Log2 fold-change shrinkage
+
+Raw DESeq2 fold changes can become very large for genes with low or unstable counts. `apeglm` is used to obtain more stable effect-size estimates for ranking and visualisation.
+
+```{r lfc-shrinkage}
+resultsNames(dds)
+
+res_shrunk <- lfcShrink(
+  dds,
+  coef = "condition_siMITF_vs_siControl",
+  type = "apeglm"
+)
+
+res_shrunk_df <- as.data.frame(res_shrunk)
+res_shrunk_df$gene_id <- rownames(res_shrunk_df)
+
+res_shrunk_annot <- merge(
+  res_shrunk_df,
+  gene_annot,
+  by = "gene_id",
+  all.x = TRUE
+)
+```
+
+Classify significant genes using adjusted p-value < 0.05 and absolute shrunken log2 fold change >= 1.
+
+```{r classify-de-genes}
+res_shrunk_annot$status <- "Not significant"
+
+res_shrunk_annot$status[
+  !is.na(res_shrunk_annot$padj) &
+  res_shrunk_annot$padj < 0.05 &
+  res_shrunk_annot$log2FoldChange >= 1
+] <- "Up"
+
+res_shrunk_annot$status[
+  !is.na(res_shrunk_annot$padj) &
+  res_shrunk_annot$padj < 0.05 &
+  res_shrunk_annot$log2FoldChange <= -1
+] <- "Down"
+
+table(res_shrunk_annot$status)
+```
+
+# 13. Volcano plot
+
+## 13.1 Volcano plot with shrunken fold changes
+
+```{r volcano}
+ggplot(
+  res_shrunk_annot,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = status
+  )
+) +
+  geom_point(alpha = 0.6, size = 1.8, na.rm = TRUE) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  theme_classic() +
+  labs(
+    title = "siMITF vs siControl",
+    x = "Shrunken log2 fold change",
+    y = "-log10 adjusted p-value"
+  )
+```
+
+## 13.2 Label the ten most significant genes
+
+```{r volcano-labelled}
+top_labels <- res_shrunk_annot[
+  !is.na(res_shrunk_annot$padj),
+]
+
+top_labels <- top_labels[
+  order(top_labels$padj),
+][1:10, ]
+
+ggplot(
+  res_shrunk_annot,
+  aes(
+    x = log2FoldChange,
+    y = -log10(padj),
+    color = status
+  )
+) +
+  geom_point(alpha = 0.6, size = 1.8, na.rm = TRUE) +
+  geom_vline(
+    xintercept = c(-1, 1),
+    linetype = "dashed"
+  ) +
+  geom_hline(
+    yintercept = -log10(0.05),
+    linetype = "dashed"
+  ) +
+  geom_text_repel(
+    data = top_labels,
+    aes(label = gene_name),
+    size = 3,
+    max.overlaps = Inf,
+    na.rm = TRUE
+  ) +
+  theme_classic() +
+  labs(
+    title = "siMITF vs siControl",
+    x = "Shrunken log2 fold change",
+    y = "-log10 adjusted p-value"
+  )
+```
+
+# 14. Over-representation analysis
+
+Define strongly differentially expressed genes using:
+
+- adjusted p-value < 0.05,
+- shrunken log2 fold change >= 1 for upregulated genes,
+- shrunken log2 fold change <= -1 for downregulated genes.
+
+```{r enrichment-gene-sets}
+up_genes <- res_shrunk_annot$gene_id[
+  !is.na(res_shrunk_annot$padj) &
+  res_shrunk_annot$padj < 0.05 &
+  res_shrunk_annot$log2FoldChange >= 1
+]
+
+down_genes <- res_shrunk_annot$gene_id[
+  !is.na(res_shrunk_annot$padj) &
+  res_shrunk_annot$padj < 0.05 &
+  res_shrunk_annot$log2FoldChange <= -1
+]
+
+length(up_genes)
+length(down_genes)
+```
+
+## 14.1 GO Biological Process enrichment
+
+```{r go-up}
+ego_up <- enrichGO(
+  gene = up_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(ego_up), 20)
+```
+
+```{r go-down}
+ego_down <- enrichGO(
+  gene = down_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  qvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(ego_down), 20)
+```
+
+```{r go-plots}
+dotplot(
+  ego_up,
+  showCategory = 15,
+  title = "GO Biological Process - genes increased in siMITF"
+)
+
+dotplot(
+  ego_down,
+  showCategory = 15,
+  title = "GO Biological Process - genes decreased in siMITF"
+)
+```
+
+## 14.2 Reactome enrichment
+
+Convert Ensembl IDs to Entrez IDs.
+
+```{r entrez-conversion}
+up_entrez <- bitr(
+  up_genes,
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+down_entrez <- bitr(
+  down_genes,
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+```
+
+```{r reactome-ora}
+reactome_up <- enrichPathway(
+  gene = up_entrez$ENTREZID,
+  organism = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+reactome_down <- enrichPathway(
+  gene = down_entrez$ENTREZID,
+  organism = "human",
+  pAdjustMethod = "BH",
+  pvalueCutoff = 0.05,
+  readable = TRUE
+)
+
+head(as.data.frame(reactome_up), 20)
+head(as.data.frame(reactome_down), 20)
+```
+
+# 15. Gene set enrichment analysis (GSEA)
+
+Unlike the over-representation analysis above, GSEA uses the **full ranked gene list** and therefore does not require a hard differential-expression cutoff.
+
+The DESeq2 Wald statistic is used for ranking because it incorporates both effect direction and uncertainty.
+
+## 15.1 Build the ranked gene list
+
+```{r gsea-ranking}
+ranked_genes <- res_annot$stat
+names(ranked_genes) <- res_annot$gene_id
+
+ranked_genes <- ranked_genes[
+  !is.na(ranked_genes)
+]
+
+ranked_genes <- sort(
+  ranked_genes,
+  decreasing = TRUE
+)
+
+head(ranked_genes)
+tail(ranked_genes)
+```
+
+Positive values are shifted toward siMITF; negative values are shifted toward siControl.
+
+## 15.2 GO Biological Process GSEA
+
+```{r gsea-go}
+gsea_go <- gseGO(
+  geneList = ranked_genes,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  verbose = FALSE
+)
+
+head(
+  as.data.frame(gsea_go)[
+    ,
+    c(
+      "ID",
+      "Description",
+      "setSize",
+      "enrichmentScore",
+      "NES",
+      "pvalue",
+      "p.adjust"
+    )
+  ],
+  20
+)
+```
+
+```{r gsea-go-dotplot}
+dotplot(
+  gsea_go,
+  showCategory = 20,
+  title = "GSEA - GO Biological Process"
+)
+```
+```{r}
+gsea_df <- as.data.frame(gsea_go)
+
+top_gsea <- gsea_df[
+  order(abs(gsea_df$NES), decreasing = TRUE),
+][1:20, ]
+
+ggplot(
+  top_gsea,
+  aes(
+    x = NES,
+    y = reorder(Description, NES),
+    size = setSize,
+    color = NES
+  )
+) +
+  geom_point() +
+  theme_classic() +
+  labs(
+    title = "GSEA – GO Biological Process",
+    x = "Normalized enrichment score (NES)",
+    y = NULL,
+    size = "Gene set size",
+    color = "NES"
+  )
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+gsea_df <- as.data.frame(gsea_go) %>%
+  filter(!is.na(p.adjust))
+
+# Top 10 enriched toward siMITF
+top_pos <- gsea_df %>%
+  filter(NES > 0) %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 10)
+
+# Top 10 enriched toward siControl
+top_neg <- gsea_df %>%
+  filter(NES < 0) %>%
+  arrange(NES) %>%
+  slice_head(n = 10)
+
+plot_df <- bind_rows(top_neg, top_pos) %>%
+  mutate(
+    Description = str_wrap(Description, width = 24)
+  ) %>%
+  arrange(NES) %>%
+  mutate(
+    Description = factor(
+      Description,
+      levels = Description
+    )
+  )
+
+ggplot(
+  plot_df,
+  aes(
+    x = NES,
+    y = Description,
+    fill = p.adjust
+  )
+) +
+  geom_col(width = 0.8) +
+  geom_vline(
+    xintercept = 0,
+    linewidth = 0.5
+  ) +
+  scale_fill_gradient(
+    low = "#b30000",
+    high = "#f4cccc",
+    name = "FDR adjusted\np-value"
+  ) +
+  labs(
+    title = "GSEA - GO Biological Process",
+    x = "Normalized Enrichment Score",
+    y = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+```
+
+```{r}
+# 1. Make sure the reduced DESeq2 object exists
+dds_no_outliers <- dds[
+  ,
+  !colnames(dds) %in% c(
+    "SRR28780442",
+    "SRR28780445"
+  )
+]
+
+dds_no_outliers$condition <- droplevels(
+  dds_no_outliers$condition
+)
+
+# 2. Refit DESeq2
+dds_no_outliers <- DESeq(dds_no_outliers)
+
+# 3. Get DESeq2 results
+res_no_outliers <- results(
+  dds_no_outliers,
+  contrast = c("condition", "siMITF", "siControl")
+)
+
+# 4. Build ranked gene list from the Wald statistic
+ranked_genes_no_outliers <- res_no_outliers$stat
+names(ranked_genes_no_outliers) <- rownames(res_no_outliers)
+
+ranked_genes_no_outliers <- ranked_genes_no_outliers[
+  !is.na(ranked_genes_no_outliers)
+]
+
+ranked_genes_no_outliers <- sort(
+  ranked_genes_no_outliers,
+  decreasing = TRUE
+)
+
+# 5. Run GSEA
+gsea_go_no_outliers <- gseGO(
+  geneList = ranked_genes_no_outliers,
+  OrgDb = org.Hs.eg.db,
+  keyType = "ENSEMBL",
+  ont = "BP",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  verbose = FALSE
+)
+
+# 6. Inspect results
+head(
+  as.data.frame(gsea_go_no_outliers)[
+    ,
+    c(
+      "ID",
+      "Description",
+      "setSize",
+      "NES",
+      "pvalue",
+      "p.adjust"
+    )
+  ],
+  30
+)
+```
+
+```{r}
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# Convert GSEA results to data frame
+gsea_no_df <- as.data.frame(gsea_go_no_outliers) %>%
+  filter(!is.na(p.adjust))
+
+# Select 10 strongest positive NES pathways = siMITF
+top_pos_no <- gsea_no_df %>%
+  filter(NES > 0) %>%
+  arrange(desc(NES)) %>%
+  slice_head(n = 10)
+
+# Select 10 strongest negative NES pathways = siControl
+top_neg_no <- gsea_no_df %>%
+  filter(NES < 0) %>%
+  arrange(NES) %>%
+  slice_head(n = 10)
+
+# Combine
+plot_no_df <- bind_rows(top_neg_no, top_pos_no) %>%
+  mutate(
+    Description = str_wrap(Description, width = 35)
+  ) %>%
+  arrange(NES) %>%
+  mutate(
+    Description = factor(
+      Description,
+      levels = Description
+    )
+  )
+
+# Plot
+ggplot(
+  plot_no_df,
+  aes(
+    x = NES,
+    y = Description,
+    fill = p.adjust
+  )
+) +
+  geom_col(width = 0.8) +
+  geom_vline(
+    xintercept = 0,
+    linewidth = 0.5
+  ) +
+  scale_fill_gradient(
+    low = "#b30000",
+    high = "#f4cccc",
+    name = "FDR adjusted\np-value"
+  ) +
+  labs(
+    title = "GSEA - GO Biological Process\nexcluding atypical samples",
+    x = "Normalized Enrichment Score (NES)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+```
+Hallmark GSEA
+```{r}
+# ============================================================
+# HALLMARK GSEA - ALL 6 SAMPLES
+# ============================================================
+
+# Install msigdbr if needed
+if (!requireNamespace("msigdbr", quietly = TRUE)) {
+  install.packages("msigdbr")
+}
+
+# Load packages
+library(msigdbr)
+library(clusterProfiler)
+library(dplyr)
+library(ggplot2)
+library(stringr)
+
+# ------------------------------------------------------------
+# 1. Get Hallmark gene sets from MSigDB
+# ------------------------------------------------------------
+
+hallmark <- msigdbr(
+  species = "Homo sapiens",
+  collection = "H"
+)
+
+# Create TERM2GENE table using Ensembl gene IDs
+hallmark_t2g <- hallmark %>%
+  select(gs_name, ensembl_gene) %>%
+  filter(!is.na(ensembl_gene)) %>%
+  distinct()
+
+# ------------------------------------------------------------
+# 2. Build ranked gene list from DESeq2 results
+#    Positive statistic = higher in siMITF
+#    Negative statistic = higher in siControl
+# ------------------------------------------------------------
+
+res_all <- results(
+  dds,
+  contrast = c("condition", "siMITF", "siControl")
+)
+
+ranked_genes <- res_all$stat
+names(ranked_genes) <- rownames(res_all)
+
+ranked_genes <- ranked_genes[
+  !is.na(ranked_genes)
+]
+
+ranked_genes <- sort(
+  ranked_genes,
+  decreasing = TRUE
+)
+
+# ------------------------------------------------------------
+# 3. Run Hallmark GSEA
+# ------------------------------------------------------------
+
+gsea_hallmark <- GSEA(
+  geneList = ranked_genes,
+  TERM2GENE = hallmark_t2g,
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  verbose = FALSE
+)
+
+# ------------------------------------------------------------
+# 4. View results
+# ------------------------------------------------------------
+
+hallmark_results <- as.data.frame(gsea_hallmark)
+
+print(
+  hallmark_results %>%
+    select(
+      Description,
+      setSize,
+      NES,
+      pvalue,
+      p.adjust
+    ) %>%
+    arrange(p.adjust)
+)
+
+# ------------------------------------------------------------
+# 5. Make NES bar plot
+# ------------------------------------------------------------
+
+plot_hallmark <- hallmark_results %>%
+  filter(!is.na(p.adjust)) %>%
+  arrange(NES) %>%
+  mutate(
+    Description = str_remove(Description, "^HALLMARK_"),
+    Description = str_replace_all(Description, "_", " "),
+    Description = str_to_title(Description),
+    Description = factor(
+      Description,
+      levels = Description
+    )
+  )
+
+ggplot(
+  plot_hallmark,
+  aes(
+    x = NES,
+    y = Description,
+    fill = p.adjust
+  )
+) +
+  geom_col(width = 0.8) +
+  geom_vline(
+    xintercept = 0,
+    linewidth = 0.5
+  ) +
+  scale_fill_gradient(
+    low = "#b30000",
+    high = "#f4cccc",
+    name = "FDR adjusted\np-value"
+  ) +
+  labs(
+    title = "Hallmark GSEA",
+    subtitle = "All 6 samples",
+    x = "Normalized Enrichment Score (NES)",
+    y = NULL
+  ) +
+  theme_classic(base_size = 12) +
+  theme(
+    axis.text.y = element_text(size = 7),
+    axis.text.x = element_text(size = 10),
+    plot.title = element_text(
+      face = "bold",
+      hjust = 0.5
+    ),
+    plot.subtitle = element_text(
+      hjust = 0.5
+    ),
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8)
+  )
+```
+
+
+## 15.3 Reactome GSEA
+
+Reactome requires Entrez IDs.
+
+```{r gsea-reactome-map}
+gene_map <- bitr(
+  names(ranked_genes),
+  fromType = "ENSEMBL",
+  toType = "ENTREZID",
+  OrgDb = org.Hs.eg.db
+)
+
+rank_df <- data.frame(
+  ENSEMBL = names(ranked_genes),
+  stat = unname(ranked_genes)
+)
+
+rank_entrez <- merge(
+  rank_df,
+  gene_map,
+  by = "ENSEMBL"
+)
+
+rank_entrez <- rank_entrez[
+  order(abs(rank_entrez$stat), decreasing = TRUE),
+]
+
+rank_entrez <- rank_entrez[
+  !duplicated(rank_entrez$ENTREZID),
+]
+
+reactome_rank <- rank_entrez$stat
+names(reactome_rank) <- rank_entrez$ENTREZID
+
+reactome_rank <- sort(
+  reactome_rank,
+  decreasing = TRUE
+)
+```
+
+```{r gsea-reactome}
+gsea_reactome <- gsePathway(
+  geneList = reactome_rank,
+  organism = "human",
+  minGSSize = 10,
+  maxGSSize = 500,
+  pvalueCutoff = 0.05,
+  pAdjustMethod = "BH",
+  verbose = FALSE
+)
+
+head(
+  as.data.frame(gsea_reactome)[
+    ,
+    c(
+      "ID",
+      "Description",
+      "setSize",
+      "enrichmentScore",
+      "NES",
+      "pvalue",
+      "p.adjust"
+    )
+  ],
+  20
+)
+```
+
+```{r gsea-reactome-dotplot}
+dotplot(
+  gsea_reactome,
+  showCategory = 20,
+  title = "GSEA - Reactome"
+)
+```
+
+For both GO and Reactome GSEA:
+
+- `NES > 0` indicates enrichment toward siMITF,
+- `NES < 0` indicates enrichment toward siControl.
+
+# 16. Export results
+
+```{r export-results}
+write.csv(
+  res_annot,
+  "results/deseq2/tables/DESeq2_results_annotated.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  res_shrunk_annot,
+  "results/deseq2/tables/DESeq2_results_shrunken_annotated.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(ego_up),
+  "results/deseq2/tables/GO_upregulated.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(ego_down),
+  "results/deseq2/tables/GO_downregulated.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(gsea_go),
+  "results/deseq2/tables/GSEA_GO_BP.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  as.data.frame(gsea_reactome),
+  "results/deseq2/tables/GSEA_Reactome.csv",
+  row.names = FALSE
+)
+```
+
+# 17. Interpretation notes
+
+The main differential-expression model retains all six biological samples.
+
+Two samples (`SRR28780442` and `SRR28780445`) show a strong shared immune-associated expression signature and dominate the global PCA. Importantly, the same pattern is reproduced using the authors' deposited kallisto abundance files. This finding is therefore documented as an important feature of the dataset rather than treated as an artefact introduced by the present re-analysis.
+
+The differential-expression heatmap is interpreted alongside the global sample-level QC. Strong candidate genes are most convincing when their expression difference is consistent across all three replicates within each condition.
+
+# 18. Session information
+
+Recording package and R versions improves reproducibility.
+
+```{r session-info}
+sessionInfo()
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
